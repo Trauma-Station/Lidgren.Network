@@ -8,8 +8,6 @@ namespace Lidgren.Network
 	{
 		private int m_lastUsedFragmentGroup;
 
-		private readonly Dictionary<NetConnection, Dictionary<int, ReceivedFragmentGroup>> m_receivedFragmentGroups;
-
 		// on user thread
 		private NetSendResult SendFragmentedMessage(NetOutgoingMessage msg, IList<NetConnection> recipients, NetDeliveryMethod method, int sequenceChannel)
 		{
@@ -133,6 +131,8 @@ namespace Lidgren.Network
 			NetException.Assert(im.SenderConnection != null);
 
 			var groups = im.SenderConnection.m_receivedFragmentGroups;
+			double now = NetTime.Now;
+			ExpireFragmentGroups(groups, now);
 			if (!groups.TryGetValue(group, out var info))
 			{
 				// single fragment groups can't accumulate unbounded buffers
@@ -143,17 +143,26 @@ namespace Lidgren.Network
 					return;
 				}
 
+				if (GetTotalFragmentGroupBytes(groups) + totalBytes > m_configuration.m_maximumFragmentReassemblyBytesPerConnection)
+				{
+					LogRateLimitedWarning(NetLogRateLimitTarget.MalformedFragment, im.SenderEndPoint, $"Too much fragment reassembly data from {im.SenderEndPoint}; dropping fragment");
+					Recycle(im);
+					return;
+				}
+
 				info = new ReceivedFragmentGroup(
 					GetStorage(totalBytes),
 					new NetBitVector(totalNumChunks),
+					totalBytes,
 					totalBits,
 					chunkByteSize,
-					totalNumChunks);
+					totalNumChunks,
+					now);
 				groups[group] = info;
 			}
 			// The computed offset/copy and received chunk bit vector depend on this
 			// header data matching the first fragment for the group.
-			else if (info.Data.Length < totalBytes
+			else if (info.TotalBytes != totalBytes
 				|| info.TotalBits != totalBits
 				|| info.ChunkByteSize != chunkByteSize
 				|| info.TotalNumChunks != totalNumChunks)
@@ -163,19 +172,24 @@ namespace Lidgren.Network
 				return;
 			}
 
-			info.ReceivedChunks[chunkNumber] = true;
-			//info.LastReceived = (float)NetTime.Now;
+			if (!info.MarkChunkReceived(chunkNumber))
+			{
+				Recycle(im);
+				return;
+			}
+
+			info.LastReceived = now;
 
 			// copy to data
 			int offset = (chunkNumber * chunkByteSize);
 			Buffer.BlockCopy(im.Data, ptr, info.Data, offset, payloadLength);
 
-			int cnt = info.ReceivedChunks.Count();
+			int cnt = info.ReceivedChunkCount;
 			//LogVerbose($"Found fragment #{chunkNumber} in group {group} offset {offset} of total bits {totalBits} (total chunks done {cnt})");
 
 			LogVerbose($"Received fragment {chunkNumber} of {totalNumChunks} ({cnt} chunks received)");
 
-			if (info.ReceivedChunks.Count() == totalNumChunks)
+			if (cnt == totalNumChunks)
 			{
 				// Done! Transform this incoming message
 				im.m_data = info.Data;
@@ -194,6 +208,30 @@ namespace Lidgren.Network
 			}
 
 			return;
+		}
+
+		private void ExpireFragmentGroups(Dictionary<int, ReceivedFragmentGroup> groups, double now)
+		{
+			if (groups.Count == 0)
+				return;
+
+			double oldestAllowed = now - m_configuration.m_fragmentGroupTimeout;
+			foreach (var pair in new List<KeyValuePair<int, ReceivedFragmentGroup>>(groups))
+			{
+				if (pair.Value.LastReceived >= oldestAllowed)
+					continue;
+
+				Recycle(pair.Value.Data);
+				groups.Remove(pair.Key);
+			}
+		}
+
+		private static int GetTotalFragmentGroupBytes(Dictionary<int, ReceivedFragmentGroup> groups)
+		{
+			int total = 0;
+			foreach (var group in groups.Values)
+				total += group.TotalBytes;
+			return total;
 		}
 	}
 }
