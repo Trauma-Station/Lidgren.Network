@@ -78,8 +78,11 @@ namespace Lidgren.Network
 		internal int m_port;
 		internal int m_receiveBufferSize;
 		internal int m_sendBufferSize;
+		internal int m_maximumPacketsPerHeartbeat;
+		internal int m_maximumBytesPerHeartbeat;
 		internal float m_resendHandshakeInterval;
 		internal int m_maximumHandshakeAttempts;
+		internal float m_connectionApprovalTimeout;
 
 		internal bool m_logRateLimiterEnabled;
 		internal NetLogRateLimitTarget m_logRateLimitTargets;
@@ -125,6 +128,8 @@ namespace Lidgren.Network
 			m_port = 0;
 			m_receiveBufferSize = 131071;
 			m_sendBufferSize = 131071;
+			m_maximumPacketsPerHeartbeat = 1024;
+			m_maximumBytesPerHeartbeat = 4 * 1024 * 1024;
 			m_acceptIncomingConnections = false;
 			m_maximumConnections = 32;
 			m_defaultOutgoingMessageCapacity = 16;
@@ -134,6 +139,7 @@ namespace Lidgren.Network
 			m_recycledCacheMaxCount = 64;
 			m_resendHandshakeInterval = 3.0f;
 			m_maximumHandshakeAttempts = 5;
+			m_connectionApprovalTimeout = 25.0f;
 			m_autoFlushSendQueue = true;
 			m_suppressUnreliableUnorderedAcks = false;
 			m_sendConnectionRejectionReasons = true;
@@ -495,6 +501,38 @@ namespace Lidgren.Network
 		}
 
 		/// <summary>
+		/// Gets or sets the maximum number of UDP packets processed during one network heartbeat. Cannot be changed once initialized.
+		/// </summary>
+		public int MaximumPacketsPerHeartbeat
+		{
+			get { return m_maximumPacketsPerHeartbeat; }
+			set
+			{
+				if (m_isLocked)
+					throw new NetException(c_isLockedMessage);
+				if (value < 1)
+					throw new NetException("MaximumPacketsPerHeartbeat must be at least 1");
+				m_maximumPacketsPerHeartbeat = value;
+			}
+		}
+
+		/// <summary>
+		/// Gets or sets the maximum number of UDP payload bytes processed during one network heartbeat. Cannot be changed once initialized.
+		/// </summary>
+		public int MaximumBytesPerHeartbeat
+		{
+			get { return m_maximumBytesPerHeartbeat; }
+			set
+			{
+				if (m_isLocked)
+					throw new NetException(c_isLockedMessage);
+				if (value < NetConstants.HeaderByteSize)
+					throw new NetException("MaximumBytesPerHeartbeat must be at least " + NetConstants.HeaderByteSize);
+				m_maximumBytesPerHeartbeat = value;
+			}
+		}
+
+		/// <summary>
 		/// Gets or sets if the NetPeer should accept incoming connections. This is automatically set to true in NetServer and false in NetClient.
 		/// </summary>
 		public bool AcceptIncomingConnections
@@ -523,6 +561,20 @@ namespace Lidgren.Network
 				if (value < 1)
 					throw new NetException("MaximumHandshakeAttempts must be at least 1");
 				m_maximumHandshakeAttempts = value;
+			}
+		}
+
+		/// <summary>
+		/// Gets or sets the maximum number of seconds a server connection may wait for application approval.
+		/// </summary>
+		public float ConnectionApprovalTimeout
+		{
+			get { return m_connectionApprovalTimeout; }
+			set
+			{
+				if (value <= 0)
+					throw new NetException("ConnectionApprovalTimeout must be greater than zero");
+				m_connectionApprovalTimeout = value;
 			}
 		}
 

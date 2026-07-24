@@ -51,6 +51,7 @@ namespace Lidgren.Network
 		private List<(SynchronizationContext, SendOrPostCallback)>? m_receiveCallbacks;
 
 		internal Action? m_onShutdown;
+		private const int MaxUPnPDiscoveryResponseBytes = 8192;
 
 		/// <summary>
 		/// Gets the socket, if Start() has been called
@@ -437,10 +438,17 @@ namespace Lidgren.Network
 
 			try
 			{
+				int packetsReceived = 0;
+				int bytesReceived = 0;
 				do
 				{
-					ReceiveSocketData(now);
-				} while (m_socket.Available > 0);
+					int packetBytes = ReceiveSocketData(now);
+					packetsReceived++;
+					bytesReceived += packetBytes;
+				}
+				while (m_socket.Available > 0
+						&& packetsReceived < m_configuration.m_maximumPacketsPerHeartbeat
+				         && bytesReceived < m_configuration.m_maximumBytesPerHeartbeat);
 			}
 			catch (SocketException sx)
 			{
@@ -465,7 +473,7 @@ namespace Lidgren.Network
 			}
 		}
 
-		private void ReceiveSocketData(double now)
+		private int ReceiveSocketData(double now)
 		{
 			Debug.Assert(m_socket != null);
 
@@ -477,39 +485,35 @@ namespace Lidgren.Network
 				ref m_senderRemote);
 
 			if (bytesReceived < NetConstants.HeaderByteSize)
-				return;
+				return bytesReceived;
 
 			//LogVerbose("Received " + bytesReceived + " bytes");
 
 			if (m_upnp != null && now < m_upnp.m_discoveryResponseDeadline && bytesReceived > 32)
 			{
 				// is this an UPnP response?
-				string resp = System.Text.Encoding.UTF8.GetString(m_receiveBuffer, 0, bytesReceived);
-				if (resp.Contains("upnp:rootdevice") || resp.Contains("UPnP/1.0"))
+				int responseBytes = Math.Min(bytesReceived, MaxUPnPDiscoveryResponseBytes);
+				string resp = System.Text.Encoding.UTF8.GetString(m_receiveBuffer, 0, responseBytes);
+				if (resp.IndexOf("upnp:rootdevice", StringComparison.OrdinalIgnoreCase) >= 0 || resp.IndexOf("UPnP/1.0", StringComparison.OrdinalIgnoreCase) >= 0)
 				{
-					try
+					string? location = TryGetUPnPLocation(resp);
+					if (location == null)
 					{
-						resp = resp.Substring(resp.ToLower().IndexOf("location:") + 9);
-						resp = resp.Substring(0, resp.IndexOf("\r")).Trim();
-					}
-					catch (Exception ex)
-					{
-						LogDebug("Failed to parse UPnP response: " + ex.ToString());
-
+						LogDebug("Failed to parse UPnP response: missing location header");
 						// don't try to parse this packet further
-						return;
+						return bytesReceived;
 					}
 
 					try
 					{
-						m_upnp.ExtractServiceUrl(resp);
-						return;
+						m_upnp.ExtractServiceUrl(location);
 					}
 					catch (Exception ex)
 					{
-						LogDebug($"Failed to fetch UPnP description for {resp} (from {(IPEndPoint)senderRemote}): {ex}");
-						return;
+						LogDebug($"Failed to fetch UPnP description for {location} (from {(IPEndPoint)senderRemote}): {ex}");
 					}
+
+					return bytesReceived;
 				}
 			}
 
@@ -551,7 +555,7 @@ namespace Lidgren.Network
 						NetLogRateLimitTarget.MalformedPacket,
 						(NetEndPoint)senderRemote,
 						$"Malformed packet from {(NetEndPoint)senderRemote}; stated payload length {payloadByteLength}, remaining bytes {(bytesReceived - ptr)}");
-					return;
+					return bytesReceived;
 				}
 
 				if (tp >= NetMessageType.Unused1 && tp <= NetMessageType.Unused29)
@@ -560,7 +564,7 @@ namespace Lidgren.Network
 						NetLogRateLimitTarget.MalformedPacket,
 						(NetEndPoint)senderRemote,
 						$"Unexpected NetMessageType: {tp}");
-					return;
+					return bytesReceived;
 				}
 
 				NetIncomingMessage? msg = null;
@@ -578,7 +582,7 @@ namespace Lidgren.Network
 					else
 					{
 						if (sender == null && !m_configuration.IsMessageTypeEnabled(NetIncomingMessageType.UnconnectedData))
-							return; // dropping unconnected message since it's not enabled
+							return bytesReceived; // dropping unconnected message since it's not enabled
 
 						msg = CreateIncomingMessage(NetIncomingMessageType.Data, payloadByteLength);
 						msg.m_isFragment = isFragment;
@@ -628,7 +632,30 @@ namespace Lidgren.Network
 
 			m_statistics.PacketReceived(bytesReceived, numMessages, numFragments);
 			if (sender != null)
+			{
 				sender.m_statistics.PacketReceived(bytesReceived, numMessages, numFragments);
+				if (sender.m_status == NetConnectionStatus.Connected)
+					sender.ResetTimeout(now);
+			}
+
+			return bytesReceived;
+		}
+
+		private static string? TryGetUPnPLocation(string response)
+		{
+			int locationStart = response.IndexOf("location:", StringComparison.OrdinalIgnoreCase);
+			if (locationStart < 0)
+				return null;
+
+			locationStart += "location:".Length;
+			int locationEnd = response.IndexOf('\r', locationStart);
+			if (locationEnd < 0)
+				locationEnd = response.IndexOf('\n', locationStart);
+			if (locationEnd < 0)
+				locationEnd = response.Length;
+
+			string location = response.Substring(locationStart, locationEnd - locationStart).Trim();
+			return location.Length == 0 ? null : location;
 		}
 
 		/// <summary>
